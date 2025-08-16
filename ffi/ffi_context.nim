@@ -4,14 +4,13 @@
 
 import std/[options, atomics, os, net, locks]
 import chronicles, chronos, chronos/threadsync, taskpools/channels_spsc_single, results
-import ./ffi_types
+import ./ffi_types, ./ffi_thread_request
 
 type FFIContext* = object
-  libraryName: cstring
   ffiThread: Thread[(ptr FFIContext)]
-    # represents the main thread in charge of attending SDK consumer actions
+    # represents the main FFI thread in charge of attending API consumer actions
   watchdogThread: Thread[(ptr FFIContext)]
-    # monitors the FFI thread and notifies the FFI SDK consumer if it hangs
+    # monitors the FFI thread and notifies the FFI API consumer if it hangs
   lock: Lock
   reqChannel: ChannelSPSCSingle[ptr FFIThreadRequest]
   reqSignal: ThreadSignalPtr # to notify the FFI Thread that a new request is sent
@@ -43,13 +42,8 @@ template callEventCallback(ctx: ptr FFIContext, eventName: string, body: untyped
         RET_ERR, unsafeAddr msg[0], cast[csize_t](len(msg)), ctx[].eventUserData
       )
 
-proc sendRequestToWakuThread*(
-    ctx: ptr FFIContext,
-    reqType: RequestType,
-    reqContent: pointer,
-    callback: FFICallBack,
-    userData: pointer,
-    timeout = InfiniteDuration,
+proc sendRequestToFFIThread*(
+    ctx: ptr FFIContext, ffiRequest: ptr FFIThreadRequest, timeout = InfiniteDuration
 ): Result[void, string] =
   ctx.lock.acquire()
   # This lock is only necessary while we use a SP Channel and while the signalling
@@ -59,26 +53,21 @@ proc sendRequestToWakuThread*(
   defer:
     ctx.lock.release()
 
-  let req = FFIThreadRequest.createShared(reqType, reqContent, callback, userData)
   ## Sending the request
-  let sentOk = ctx.reqChannel.trySend(req)
+  let sentOk = ctx.reqChannel.trySend(ffiRequest)
   if not sentOk:
-    deallocShared(req)
-    return err("Couldn't send a request to the waku thread: " & $req[])
+    return err("Couldn't send a request to the ffi thread")
 
   let fireSyncRes = ctx.reqSignal.fireSync()
   if fireSyncRes.isErr():
-    deallocShared(req)
     return err("failed fireSync: " & $fireSyncRes.error)
 
   if fireSyncRes.get() == false:
-    deallocShared(req)
     return err("Couldn't fireSync in time")
 
   ## wait until the Waku Thread properly received the request
   let res = ctx.reqReceivedSignal.waitSync(timeout)
   if res.isErr():
-    deallocShared(req)
     return err("Couldn't receive reqReceivedSignal signal")
 
   ## Notice that in case of "ok", the deallocShared(req) is performed by the Waku Thread in the
@@ -110,24 +99,24 @@ proc watchdogThreadBody(ctx: ptr FFIContext) {.thread.} =
 
       trace "Sending watchdog request to FFI thread"
 
-      sendRequestToWakuThread(
-        ctx,
-        RequestType.DEBUG,
-        DebugNodeRequest.createShared(DebugNodeMsgType.CHECK_WAKU_NOT_BLOCKED),
-        wakuCallback,
-        nilUserData,
-        WakuNotRespondingTimeout,
-      ).isOkOr:
-        error "Failed to send watchdog request to FFI thread", error = $error
-        onWakuNotResponding(ctx)
+      # sendRequestToFFIThread(
+      #   ctx,
+      #   0,
+      #   DebugNodeRequest.createShared(DebugNodeMsgType.CHECK_WAKU_NOT_BLOCKED),
+      #   wakuCallback,
+      #   nilUserData,
+      #   WakuNotRespondingTimeout,
+      # ).isOkOr:
+      #   error "Failed to send watchdog request to FFI thread", error = $error
+      #   onWakuNotResponding(ctx)
 
   waitFor watchdogRun(ctx)
 
-proc ffiThreadBody(ctx: ptr FFIContext) {.thread.} =
+proc ffiThreadBody[TT](ctx: ptr FFIContext) {.thread.} =
   ## FFI thread that attends library user API requests
 
   let ffiRun = proc(ctx: ptr FFIContext) {.async.} =
-    var waku: Waku
+    var ffiHandler: TT
     while true:
       await ctx.reqSignal.wait()
 
@@ -138,11 +127,11 @@ proc ffiThreadBody(ctx: ptr FFIContext) {.thread.} =
       var request: ptr FFIThreadRequest
       let recvOk = ctx.reqChannel.tryRecv(request)
       if not recvOk:
-        error "ffi thread could not receive a request"
+        chronicles.error "ffi thread could not receive a request"
         continue
 
       ## Handle the request
-      asyncSpawn FFIThreadRequest.process(request, addr waku)
+      asyncSpawn FFIThreadRequest.process(request, addr ffiHandler)
 
       let fireRes = ctx.reqReceivedSignal.fireSync()
       if fireRes.isErr():
@@ -150,7 +139,7 @@ proc ffiThreadBody(ctx: ptr FFIContext) {.thread.} =
 
   waitFor ffiRun(ctx)
 
-proc createFFIContext*(libraryName: cstring): Result[ptr FFIContext, string] =
+proc createFFIContext*[T](tt: typedesc[T]): Result[ptr FFIContext, string] =
   ## This proc is called from the main thread and it creates
   ## the FFI working thread.
   var ctx = createShared(FFIContext, 1)
@@ -163,7 +152,7 @@ proc createFFIContext*(libraryName: cstring): Result[ptr FFIContext, string] =
   ctx.running.store(true)
 
   try:
-    createThread(ctx.ffiThread, ffiThreadBody, ctx)
+    createThread(ctx.ffiThread, ffiThreadBody[tt], ctx)
   except ValueError, ResourceExhaustedError:
     freeShared(ctx)
     return err("failed to create the Waku thread: " & getCurrentExceptionMsg())
@@ -176,7 +165,7 @@ proc createFFIContext*(libraryName: cstring): Result[ptr FFIContext, string] =
 
   return ok(ctx)
 
-proc destroyFFIContext*(ctx: ptr FFIContext): Result[void, string] =
+proc destroyFFIContext*[T](ctx: ptr FFIContext): Result[void, string] =
   ctx.running.store(false)
 
   let signaledOnTime = ctx.reqSignal.fireSync().valueOr:
@@ -189,7 +178,6 @@ proc destroyFFIContext*(ctx: ptr FFIContext): Result[void, string] =
   ctx.lock.deinitLock()
   ?ctx.reqSignal.close()
   ?ctx.reqReceivedSignal.close()
-  deallocShared(ctx.libraryName)
   freeShared(ctx)
 
   return ok()
