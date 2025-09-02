@@ -1,3 +1,5 @@
+import chronos
+
 ################################################################################
 ### Exported types
 
@@ -14,6 +16,9 @@ const RET_MISSING_CALLBACK*: cint = 2
 
 ################################################################################
 ### FFI utils
+
+type FFIRequestProc* =
+  proc(request: pointer, reqHandler: pointer): Future[Result[string, string]] {.async.}
 
 template foreignThreadGc*(body: untyped) =
   when declared(setupForeignThreadGc):

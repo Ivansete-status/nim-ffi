@@ -4,7 +4,7 @@
 
 import std/[options, atomics, os, net, locks]
 import chronicles, chronos, chronos/threadsync, taskpools/channels_spsc_single, results
-import ./ffi_types, ./ffi_thread_request
+import ./ffi_types, ./ffi_thread_request, ./internal/ffi_macro
 
 type FFIContext* = object
   ffiThread: Thread[(ptr FFIContext)]
@@ -20,6 +20,7 @@ type FFIContext* = object
   eventCallback*: pointer
   eventUserdata*: pointer
   running: Atomic[bool] # To control when the threads are running
+  registeredRequests: Table[string, FFIRequestProc]
 
 const git_version* {.strdefine.} = "n/a"
 
@@ -131,7 +132,9 @@ proc ffiThreadBody[TT](ctx: ptr FFIContext) {.thread.} =
         continue
 
       ## Handle the request
-      asyncSpawn FFIThreadRequest.process(request, addr ffiHandler)
+      asyncSpawn FFIThreadRequest.process(
+        request, addr ffiHandler, addr ctx.registeredRequests
+      )
 
       let fireRes = ctx.reqReceivedSignal.fireSync()
       if fireRes.isErr():
@@ -148,6 +151,7 @@ proc createFFIContext*[T](tt: typedesc[T]): Result[ptr FFIContext, string] =
   ctx.reqReceivedSignal = ThreadSignalPtr.new().valueOr:
     return err("couldn't create reqReceivedSignal ThreadSignalPtr")
   ctx.lock.initLock()
+  ctx.registeredRequests = ffi_macro.registeredRequests
 
   ctx.running.store(true)
 
