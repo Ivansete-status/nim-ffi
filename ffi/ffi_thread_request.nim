@@ -2,39 +2,34 @@
 ## The requests are created by the main thread and processed by
 ## the Waku Thread.
 
-import std/macros
-import std/json, results
+import std/[json, macros], results, tables
 import chronos, chronos/threadsync
-import ./ffi_types, ./internal/ffi_macro
+import ./ffi_types, ./internal/ffi_macro, ./alloc, ./ffi_context
 import waku/factory/waku
-import ../../../library/waku_thread_requests/requests/peer_manager_request
-# type FFIRequestProcessor* =
-#   concept
-#       proc process[R](
-#         T: type FFIThreadRequest, request: ptr FFIThreadRequest, reqHandler: ptr R
-#       )
+# import ../../../library/waku_thread_requests/requests/peer_manager_request
 
 type FFIThreadRequest* = object
   callback: FFICallBack
   userData: pointer
-  reqId: uint
+  reqId: cstring
   reqContent*: pointer
 
 proc init*(
     T: typedesc[FFIThreadRequest],
     callback: FFICallBack,
     userData: pointer,
-    reqId: uint,
+    reqId: cstring,
     reqContent: pointer,
 ): ptr type T =
   var ret = createShared(FFIThreadRequest)
   ret[].callback = callback
   ret[].userData = userData
-  ret[].reqId = reqId
+  ret[].reqId = reqId.alloc()
   ret[].reqContent = reqContent
   return ret
 
 proc deleteRequest(request: ptr FFIThreadRequest) =
+  deallocShared(request[].reqId)
   deallocShared(request)
 
 proc handleRes[T: string | void](
@@ -63,21 +58,20 @@ proc handleRes[T: string | void](
     )
   return
 
-proc nilProcess(reqId: uint): Future[Result[string, string]] {.async.} =
+proc nilProcess(reqId: cstring): Future[Result[string, string]] {.async.} =
   return err("This request type is not implemented: " & $reqId)
 
-ffiGenerateProcess()
+proc process*[R](
+    T: type FFIThreadRequest,
+    request: ptr FFIThreadRequest,
+    reqHandler: ptr R,
+    registeredRequests: ptr Table[string, FFIRequestProc],
+) {.async.} =
+  let reqId = $request[].reqId
 
-# dumpAstGen:
-#   proc process*[R](
-#       T: type FFIThreadRequest, request: ptr FFIThreadRequest, reqHandler: ptr R
-#   ) {.async.} =
-#     # reqHandler represents the object that actually processes the request.
-#     let retFut =
-#       case request[].reqId
-#       of 1:
-#         cast[ptr PeerManagementRequest](request[].reqContent).process(reqHandler)
-#       else:
-#         nilProcess(request[].reqId)
-
-#     handleRes(await retFut, request)
+  let retFut =
+    if not registeredRequests[].contains(reqId):
+      nilProcess(request[].reqId)
+    else:
+      registeredRequests[][reqId](request[].reqContent, reqHandler)
+  handleRes(await retFut, request)
