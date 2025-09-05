@@ -65,7 +65,7 @@ proc process*[R](
     T: type FFIThreadRequest,
     request: ptr FFIThreadRequest,
     reqHandler: ptr R,
-    registeredRequests: ptr Table[string, FFIRequestProc],
+    registeredRequests: ptr Table[cstring, FFIRequestProc],
 ) {.async.} =
   let reqId = $request[].reqId
 

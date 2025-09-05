@@ -2,7 +2,7 @@
 {.pragma: callback, cdecl, raises: [], gcsafe.}
 {.passc: "-fPIC".}
 
-import std/[options, atomics, os, net, locks]
+import std/[options, atomics, os, net, locks, json]
 import chronicles, chronos, chronos/threadsync, taskpools/channels_spsc_single, results
 import ./ffi_types, ./ffi_thread_request, ./internal/ffi_macro
 
@@ -20,13 +20,13 @@ type FFIContext* = object
   eventCallback*: pointer
   eventUserdata*: pointer
   running: Atomic[bool] # To control when the threads are running
-  registeredRequests: Table[string, FFIRequestProc]
+  registeredRequests: ptr Table[cstring, FFIRequestProc]
 
 const git_version* {.strdefine.} = "n/a"
 
-template callEventCallback(ctx: ptr FFIContext, eventName: string, body: untyped) =
+template callEventCallback*(ctx: ptr FFIContext, eventName: string, body: untyped) =
   if isNil(ctx[].eventCallback):
-    error eventName & " - eventCallback is nil"
+    chronicles.error eventName & " - eventCallback is nil"
     return
 
   foreignThreadGc:
@@ -75,6 +75,24 @@ proc sendRequestToFFIThread*(
   ## process proc. See the 'waku_thread_request.nim' module for more details.
   ok()
 
+type Foo = object
+registerReqFFI(WatchdogReq, foo: ptr Foo):
+  proc(): Future[Result[string, string]] {.async.} =
+    return ok("waku thread is not blocked")
+
+type JsonWakuNotRespondingEvent = object
+  eventType: string
+
+proc init(T: type JsonWakuNotRespondingEvent): T =
+  return JsonWakuNotRespondingEvent(eventType: "not_responding")
+
+proc `$`(event: JsonWakuNotRespondingEvent): string =
+  $(%*event)
+
+proc onWakuNotResponding*(ctx: ptr FFIContext) =
+  callEventCallback(ctx, "onWakuNotResponsive"):
+    $JsonWakuNotRespondingEvent.init()
+
 proc watchdogThreadBody(ctx: ptr FFIContext) {.thread.} =
   ## Watchdog thread that monitors the Waku thread and notifies the library user if it hangs.
 
@@ -100,16 +118,9 @@ proc watchdogThreadBody(ctx: ptr FFIContext) {.thread.} =
 
       trace "Sending watchdog request to FFI thread"
 
-      # sendRequestToFFIThread(
-      #   ctx,
-      #   0,
-      #   DebugNodeRequest.createShared(DebugNodeMsgType.CHECK_WAKU_NOT_BLOCKED),
-      #   wakuCallback,
-      #   nilUserData,
-      #   WakuNotRespondingTimeout,
-      # ).isOkOr:
-      #   error "Failed to send watchdog request to FFI thread", error = $error
-      #   onWakuNotResponding(ctx)
+      sendRequestToFFIThread(ctx, WatchdogReq.ffiNewReq(wakuCallback, nilUserData)).isOkOr:
+        error "Failed to send watchdog request to FFI thread", error = $error
+        onWakuNotResponding(ctx)
 
   waitFor watchdogRun(ctx)
 
@@ -133,7 +144,7 @@ proc ffiThreadBody[TT](ctx: ptr FFIContext) {.thread.} =
 
       ## Handle the request
       asyncSpawn FFIThreadRequest.process(
-        request, addr ffiHandler, addr ctx.registeredRequests
+        request, addr ffiHandler, ctx.registeredRequests
       )
 
       let fireRes = ctx.reqReceivedSignal.fireSync()
@@ -151,7 +162,7 @@ proc createFFIContext*[T](tt: typedesc[T]): Result[ptr FFIContext, string] =
   ctx.reqReceivedSignal = ThreadSignalPtr.new().valueOr:
     return err("couldn't create reqReceivedSignal ThreadSignalPtr")
   ctx.lock.initLock()
-  ctx.registeredRequests = ffi_macro.registeredRequests
+  ctx.registeredRequests = addr ffi_macro.registeredRequests
 
   ctx.running.store(true)
 
@@ -169,7 +180,7 @@ proc createFFIContext*[T](tt: typedesc[T]): Result[ptr FFIContext, string] =
 
   return ok(ctx)
 
-proc destroyFFIContext*[T](ctx: ptr FFIContext): Result[void, string] =
+proc destroyFFIContext*(ctx: ptr FFIContext): Result[void, string] =
   ctx.running.store(false)
 
   let signaledOnTime = ctx.reqSignal.fireSync().valueOr:
@@ -185,3 +196,10 @@ proc destroyFFIContext*[T](ctx: ptr FFIContext): Result[void, string] =
   freeShared(ctx)
 
   return ok()
+
+template checkParams*(ctx: ptr FFIContext, callback: FFICallBack, userData: pointer) =
+  if not isNil(ctx):
+    ctx[].userData = userData
+
+  if isNil(callback):
+    return RET_MISSING_CALLBACK
