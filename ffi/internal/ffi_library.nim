@@ -78,5 +78,18 @@ macro declareLibrary*(libraryName: static[string]): untyped =
 
   res.add(initializeLibraryProc)
 
+  ## Generate the exported C-callable callback setter
+  let setCallbackProc = quote:
+    proc set_event_callback(
+        ctx: ptr FFIContext, callback: FFICallBack, userData: pointer
+    ) {.dynlib, exportc.} =
+      initializeLibrary()
+      ctx[].eventCallback = cast[pointer](callback)
+      ctx[].eventUserData = userData
+
+  res.add(setCallbackProc)
+
   echo result.repr
   return res
+
+
