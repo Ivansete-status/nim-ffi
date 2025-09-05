@@ -317,7 +317,7 @@ macro registerReqFFI*(reqTypeName, reqHandler, body: untyped): untyped =
   let deleteProc = buildFfiDeleteReqProc(reqTypeName, fields)
   result = newStmtList(typeDef, ffiNewReqProc, deleteProc, processProc, addNewReqToReg)
 
-  echo "Registered FFI request: " & result.repr
+  # echo "Registered FFI request: " & result.repr
 
 macro processReq*(reqType: typed, args: varargs[untyped]): untyped =
   ## Expands T.processReq(a,b,...) into the sendRequest boilerplate.

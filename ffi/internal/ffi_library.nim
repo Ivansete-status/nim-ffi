@@ -89,7 +89,7 @@ macro declareLibrary*(libraryName: static[string]): untyped =
 
   res.add(setCallbackProc)
 
-  echo result.repr
+  # echo result.repr
   return res
 
 
