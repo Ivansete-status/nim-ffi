@@ -6,7 +6,6 @@ import std/[json, macros], results, tables
 import chronos, chronos/threadsync
 import ./ffi_types, ./internal/ffi_macro, ./alloc, ./ffi_context
 import waku/factory/waku
-# import ../../../library/waku_thread_requests/requests/peer_manager_request
 
 type FFIThreadRequest* = object
   callback: FFICallBack
